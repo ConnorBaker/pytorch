@@ -34,7 +34,7 @@ def _create_onnx_supports_op_overload_table(
     # This is a workaround to make sure we register ONNX symbolic functions for these.
     onnx_supported_aten_lookup_table = [
         k.split("::")[1].split(".")[0]
-        for k in registry.all_functions()
+        for k in registry._all_registered_ops()
         if k.startswith("aten::")
     ]
 
@@ -51,7 +51,11 @@ def _create_onnx_supports_op_overload_table(
                 continue
 
             exporter_look_up_key = op_overload_packet._qualified_op_name
-            if registry.get_function_group(exporter_look_up_key) is None:
+            # overload name is torch.ops.<domain>.<op_name>.<overload>
+            domain, opname = exporter_look_up_key.split("::")
+            if not registry.is_registered_op(
+                domain=domain, op_name=opname, overload=None
+            ):
                 # This aten op doesn't have ONNX overloads.
                 continue
 

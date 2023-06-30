@@ -7,13 +7,12 @@ import warnings
 from typing import (
     Any,
     Callable,
-    Collection,
     Dict,
+    List,
     Optional,
-    Protocol,
-    runtime_checkable,
     Sequence,
     Set,
+    Tuple,
     TYPE_CHECKING,
     Union,
 )
@@ -21,7 +20,6 @@ from typing import (
 import torch
 import torch._ops
 import torch.fx
-from torch.onnx import _constants
 from torch.onnx._internal import _beartype
 from torch.onnx._internal.fx import (
     diagnostics,
@@ -33,17 +31,6 @@ from torch.onnx._internal.fx import (
 if TYPE_CHECKING:
     import onnx.defs  # type: ignore[import]
     import onnxscript  # type: ignore[import]
-
-
-# Enable both TorchScriptTensor and torch.Tensor to be tested
-# for dtype in OpSchemaWrapper.
-
-
-@runtime_checkable
-class _TensorLike(Protocol):
-    @property
-    def dtype(self) -> Optional[torch.dtype]:
-        ...
 
 
 class OnnxFunctionDispatcher:
@@ -89,7 +76,9 @@ class OnnxFunctionDispatcher:
     def dispatch(
         self,
         node: torch.fx.Node,
-        onnx_args: Sequence[Optional[Union[_TensorLike, str, int, float, bool, list]]],
+        onnx_args: Sequence[
+            Optional[Union[fx_type_utils.TensorLike, str, int, float, bool, list]]
+        ],
         onnx_kwargs: Dict[str, fx_type_utils.Argument],
         diagnostic_context: diagnostics.DiagnosticContext,
     ) -> Union["onnxscript.OnnxFunction", "onnxscript.TracedOnnxFunction"]:
@@ -107,15 +96,16 @@ class OnnxFunctionDispatcher:
         aten_name = self.get_aten_name(node, diagnostic_context)
         # If there are no overloaded functions available for the given FX node, raise an
         # unsupported error
-        function_overloads = self.get_function_overloads(
-            node, aten_name, diagnostic_context
+        all_functions, custom_functions = self.get_function_overloads(
+            node, *aten_name, diagnostic_context
         )
         # If there are overloaded functions available, we will find one that perfect or
         # nearest matches the given arguments and keyword arguments
         return self._find_the_perfect_or_nearest_match_onnxfunction(
             node,
-            aten_name,
-            function_overloads,
+            *aten_name,
+            all_functions,
+            custom_functions,
             onnx_args,
             onnx_kwargs,
             diagnostic_context,
@@ -125,30 +115,64 @@ class OnnxFunctionDispatcher:
     def _find_the_perfect_or_nearest_match_onnxfunction(
         self,
         node: torch.fx.Node,
-        aten_name: str,
-        function_overloads: Set[
-            Union["onnxscript.OnnxFunction", "onnxscript.TracedOnnxFunction"]
+        domain: str,
+        op_name: str,
+        overload: Optional[str],
+        all_functions: Set[registration.SymbolicFunction],
+        custom_functions: Optional[Set[registration.SymbolicFunction]],
+        onnx_args: Sequence[
+            Optional[Union[fx_type_utils.TensorLike, str, int, float, bool, list]]
         ],
-        onnx_args: Sequence[Optional[Union[_TensorLike, str, int, float, bool, list]]],
         onnx_kwargs: Dict[str, fx_type_utils.Argument],
         diagnostic_context: diagnostics.DiagnosticContext,
     ):
-        """Find the perfect/nearest matched OnnxFunction for the given FX node, arguments, and keyword arguments."""
-        overload_match_ranking: Dict[
-            Union[onnxscript.OnnxFunction, onnxscript.TracedOnnxFunction], int
-        ] = {}
+        """Find the perfect/nearest matched OnnxFunction for the given FX node, arguments, and keyword arguments.
+
+        Args:
+            node: The TorchFX node to dispatch the function for.
+            domain: The domain of the ONNX node.
+            op_name: The name of the ONNX node.
+            overload: The FX overload of the node. It's None if the node is default overload.
+            all_functions: All overloaded functions.
+            custom_functions: Custom overloaded functions.
+            onnx_args: The arguments of the ONNX function.
+            onnx_kwargs: The keyword arguments of the ONNX function.
+            diagnostic_context: The diagnostic context to use for reporting errors.
+
+            Returns:
+                Either an `onnxscript.OnnxFunction` or `onnxscript.TracedOnnxFunction` instance based on the dispatch algorithm.
+            Raises:
+                RuntimeError: If there are no overloaded functions available for the given FX node.
+        """
         # TODO(justinchuby): Cache the OpSchemaWrapper so we don't need to run the init logic everytime
-        for overload_func in function_overloads:
+        overload_match_ranking: Dict[registration.SymbolicFunction, int] = {}
+
+        # If there are custom functions, we will try to find the perfect match first
+        if custom_functions is not None:
+            for custom_symbolic_function in custom_functions:
+                overload_func = custom_symbolic_function.onnx_function
+                function_opschema = _OpSchemaWrapper(overload_func.op_schema)
+                if function_opschema.perfect_match_inputs(onnx_args, onnx_kwargs):
+                    # If the perfect match is found, return the function
+                    return overload_func
+
+        # If there are no custom functions or the perfect match is not found, we will
+        # try to find the nearest match among all functions
+        for symbolic_function in all_functions:
+            overload_func = symbolic_function.onnx_function
             function_opschema = _OpSchemaWrapper(overload_func.op_schema)
             if function_opschema.perfect_match_inputs(onnx_args, onnx_kwargs):
                 # If the perfect match is found, return the function
                 return overload_func
             # Record the match score for the nearest match if it's not the perfect match
-            overload_match_ranking[overload_func] = function_opschema.match_score
+            overload_match_ranking[symbolic_function] = function_opschema.match_score
 
-        # TODO(titaiwang): Change inflight_diagnostic to a new rule. Do we need to handle
-        # the special case where the same scores happended?
         # If the perfect match is not found, find the nearest match
+        if overload is None:
+            # NOTE: "default" overload
+            aten_name = f"{domain}::{op_name}"
+        else:
+            aten_name = f"{domain}::{op_name}.{overload}"
         warnings.warn(
             f"A perfect matched Opchema is not found in torchlib for {aten_name}, but \n"
             f"a nearest match is found. Please check the ONNX output carefully. \n",
@@ -161,12 +185,20 @@ class OnnxFunctionDispatcher:
             unsupported_fx_node=node,
         )
         diagnostic_context.log(diagnostic)
-        return max(overload_match_ranking, key=overload_match_ranking.get)  # type: ignore[arg-type]
+
+        # NOTE: Tie breaker: if there are multiple nearest matches, we will choose the one
+        # that is custom first
+        symbolic_function_list: List[registration.SymbolicFunction] = sorted(
+            overload_match_ranking,
+            key=lambda k: (overload_match_ranking[k], k.is_custom),
+            reverse=True,
+        )
+        return symbolic_function_list[0].onnx_function
 
     @_beartype.beartype
     def get_aten_name(
         self, node: torch.fx.Node, diagnostic_context: diagnostics.DiagnosticContext
-    ) -> str:
+    ) -> Tuple[str, str, Optional[str]]:
         """Get the aten name from the target.
 
         Args:
@@ -174,10 +206,10 @@ class OnnxFunctionDispatcher:
             diagnostic_context: The diagnostic context to use for reporting errors.
 
         Returns:
-            The aten name of the given node.
+            The aten name of the given node: domain, op_name, overload.
         """
         if node.target == operator.getitem:
-            return "aten::getitem"
+            return "aten", "getitem", None
         if isinstance(node.target, torch._ops.OpOverloadPacket):
             # aten::sym_size is the only OverloadPacket that we support.
             # schema: aten::sym_size(Tensor self, int dim) -> Tensor
@@ -194,7 +226,8 @@ class OnnxFunctionDispatcher:
             # overloadpacket for some reasons.
             # https://github.com/pytorch/pytorch/issues/97201
             aten_op_default = node.target.default
-            return aten_op_default.name()  # type: ignore[attr-defined]
+            # NOTE: default doesn't have "overload"
+            return _split_opname_to_domain_op_overload(aten_op_default.name())  # type: ignore[attr-defined]
 
         if _symint_symfloat_builtin_to_exporter_key_table(node.target) is not None:
             # Make sure it's symint/symfloat consuming builtin ops.
@@ -217,9 +250,11 @@ class OnnxFunctionDispatcher:
                     diagnostic_context.log(diagnostic)
                     raise diagnostics.RuntimeErrorWithDiagnostic(diagnostic)
             aten_op = _symint_symfloat_builtin_to_exporter_key_table(node.target)
-            return aten_op.name()  # type: ignore[attr-defined]
+            # overload name is torch.ops.<domain>.<op_name>.<overload>
+            return _split_opname_to_domain_op_overload(aten_op.name())  # type: ignore[attr-defined]
+
         if isinstance(node.target, torch._ops.OpOverload):
-            return node.target.name()
+            return _split_opname_to_domain_op_overload(node.target.name())
 
         # Unexpected target, raise error.
         diagnostic = diagnostics.UnsupportedFxNodeDiagnostic(
@@ -235,45 +270,64 @@ class OnnxFunctionDispatcher:
     def get_function_overloads(
         self,
         node: torch.fx.Node,
-        aten_name: str,
+        domain: str,
+        op_name: str,
+        overload: Optional[str],
         diagnostic_context: diagnostics.DiagnosticContext,
-    ) -> Set[Union["onnxscript.OnnxFunction", "onnxscript.TracedOnnxFunction"]]:
+    ) -> Tuple[
+        Set[registration.SymbolicFunction], Optional[Set[registration.SymbolicFunction]]
+    ]:
         """Get the function overloads from the registry.
 
         Args:
             node: The node to get the function overloads for.
-            aten_name: The aten name of the node.
+            domain: The domain of the node.
+            op_name: The name of the node.
+            overload: The FX overload of the node. It's None if the node is default overload.
             diagnostic_context: The diagnostic context to use for reporting errors.
 
         Returns:
-            Set of function overloads.
+            Set of SymbolicFunctions.
         """
-        function_group = None
 
-        if self.onnx_registry.is_registered_op(aten_name, self.opset_version):
-            function_group = self.onnx_registry.get_function_group(aten_name)
+        # NOTE: If the ATen/Custom operators are nt registered, these two groups will be None.
+        # And non-registerd ATen/Custom operators will trigger error in the next step.
+        function_group: Optional[Set[registration.SymbolicFunction]] = None
+        custom_function_group: Optional[Set[registration.SymbolicFunction]] = None
 
-        # Fall back to overloadpacket name: eg: aten.add.Tensor -> aten::add
+        if self.onnx_registry.is_registered_op(
+            domain=domain, op_name=op_name, overload=overload
+        ):
+            function_group = self.onnx_registry.get_functions(
+                domain=domain, op_name=op_name, overload=overload
+            )
+            custom_function_group = self.onnx_registry._get_custom_functions(
+                domain=domain, op_name=op_name, overload=overload
+            )
+
+        # NOTE: Fall back to overloadpacket name: eg: aten.add.Tensor -> aten::add
+        # Support default fallback for overloadpacket.
         elif hasattr(
             node.target, "overloadpacket"
         ) and self.onnx_registry.is_registered_op(
-            node.target.overloadpacket._qualified_op_name,  # type: ignore[union-attr]
-            self.opset_version,
+            domain=domain, op_name=op_name, overload=None
         ):
-            function_group = self.onnx_registry.get_function_group(
-                node.target.overloadpacket._qualified_op_name  # type: ignore[union-attr]
+            function_group = self.onnx_registry.get_functions(
+                domain=domain, op_name=op_name, overload=None
+            )
+            custom_function_group = self.onnx_registry._get_custom_functions(
+                domain=domain, op_name=op_name, overload=None
             )
 
         if function_group is not None:
-            # TODO(titaiwang): dispatch opset version.
-            dispatched_version = _dispatch_opset_version(
-                self.opset_version, function_group.support_opset()
-            )
-            if dispatched_version is not None:
-                function_overloads = function_group.get(dispatched_version)
-                if function_overloads is not None:
-                    return function_overloads
+            return function_group, custom_function_group
 
+        # If we can't find the function group, raise error.
+        if overload is None:
+            # NOTE: "default" overload
+            aten_name = f"{domain}::{op_name}"
+        else:
+            aten_name = f"{domain}::{op_name}.{overload}"
         diagnostic = diagnostics.UnsupportedFxNodeDiagnostic(
             diagnostics.rules.no_symbolic_function_for_call_function,
             diagnostics.levels.ERROR,
@@ -300,48 +354,6 @@ def _symint_symfloat_builtin_to_exporter_key_table(
         operator.sub: torch.ops.aten.sub.default,  # type: ignore[has-type]
     }
     return _SYMINT_SYMFLOAT_BUILTIN_TO_EXPORTER_KEY_TABLE.get(target)
-
-
-@_beartype.beartype
-def _dispatch_opset_version(
-    target: int, registered_opsets: Collection[int]
-) -> Optional[int]:
-    """Finds the registered opset given a target opset version and the available opsets.
-
-    O(number of registered versions of an op) search is performed to find the most
-    recent version of the op.
-
-    Args:
-        target: The target opset version.
-        registered_opsets: The available opsets.
-
-    Returns:
-        The registered opset version.
-    """
-    if not registered_opsets:
-        return None
-
-    descending_registered_versions = sorted(registered_opsets, reverse=True)
-    # Linear search for the opset version, which is fine since the number of opset
-    # versions is small.
-
-    if target >= _constants.ONNX_BASE_OPSET:
-        # Always look down toward opset 1 when the target is >= ONNX_BASE_OPSET (opset 9).
-        # When a custom op is register at opset 1, we want to be able to discover it as a
-        # fallback for all opsets >= ONNX_BASE_OPSET.
-        for version in descending_registered_versions:
-            if version <= target:
-                return version
-        return None
-
-    # target < opset 9. This is the legacy behavior to support opset 7 and opset 8.
-    # for caffe2 support. We search up toward opset 9.
-    for version in reversed(descending_registered_versions):
-        # Count back up until _constants.ONNX_BASE_OPSET
-        if target <= version <= _constants.ONNX_BASE_OPSET:
-            return version
-
-    return None
 
 
 class _OpSchemaWrapper:
@@ -436,7 +448,9 @@ class _OpSchemaWrapper:
     @_beartype.beartype
     def perfect_match_inputs(
         self,
-        args: Sequence[Optional[Union[_TensorLike, str, int, float, bool, list]]],
+        args: Sequence[
+            Optional[Union[fx_type_utils.TensorLike, str, int, float, bool, list]]
+        ],
         kwargs: Dict[str, fx_type_utils.Argument],
     ) -> bool:
         """Check if the inputs perfectly match the OpSchema requirements.
@@ -478,7 +492,9 @@ class _OpSchemaWrapper:
     @_beartype.beartype
     def _record_matching_score(
         self,
-        args: Sequence[Optional[Union[_TensorLike, str, int, float, bool, list]]],
+        args: Sequence[
+            Optional[Union[fx_type_utils.TensorLike, str, int, float, bool, list]]
+        ],
         kwargs: Dict[str, fx_type_utils.Argument],
     ):
         """Calculate the inputs matching score of the OpSchema requirements to find the nearest match.
@@ -517,16 +533,21 @@ class _OpSchemaWrapper:
 
 @_beartype.beartype
 def _find_onnx_data_type(
-    torch_input: Optional[Union[_TensorLike, str, int, float, bool, list, tuple]]
+    torch_input: Optional[
+        Union[fx_type_utils.TensorLike, str, int, float, bool, list, tuple]
+    ]
 ) -> Set[str]:
     """Convert inputs data type from torch acceptable dtype to the compatible onnx dtype string."""
-    if isinstance(torch_input, _TensorLike) and torch_input.dtype is not None:
+    if (
+        isinstance(torch_input, fx_type_utils.TensorLike)
+        and torch_input.dtype is not None
+    ):
         return fx_type_utils.from_torch_dtype_to_onnx_dtype_str(torch_input.dtype)
     if isinstance(torch_input, (int, float, bool, str)):
         return fx_type_utils.from_torch_dtype_to_onnx_dtype_str(type(torch_input))
     if isinstance(torch_input, (list, tuple)) and torch_input:  # [Tensor, Tensor]
         set_dtype = _find_onnx_data_type(torch_input[0])
-        if any(isinstance(input, _TensorLike) for input in torch_input):
+        if any(isinstance(input, fx_type_utils.TensorLike) for input in torch_input):
             # NOTE: Any Tensor involved in a list would make it a seq(tensor(onnx_type))
             return {f"seq({dtype})" for dtype in set_dtype}
         else:
@@ -534,7 +555,10 @@ def _find_onnx_data_type(
             return set_dtype
     if (
         torch_input is None
-        or (isinstance(torch_input, _TensorLike) and torch_input.dtype is None)
+        or (
+            isinstance(torch_input, fx_type_utils.TensorLike)
+            and torch_input.dtype is None
+        )
         or (isinstance(torch_input, (list, tuple)) and not torch_input)
     ):
         # NOTE: None, No dtype, and empty list are edge cases, we allow it to be any type to relax the type check
@@ -542,3 +566,21 @@ def _find_onnx_data_type(
         return set()
 
     raise RuntimeError(f"Unknown input type from input: {torch_input}")
+
+
+@_beartype.beartype
+def _split_opname_to_domain_op_overload(op_name: str) -> Tuple[str, str, Optional[str]]:
+    """Split op_name to domain, op, and overload.
+
+    Args:
+        op_name: The op name.
+
+    Returns:
+        A tuple of domain, op, and overload.
+    """
+
+    # overload name is torch.ops.<domain>.<op_name>.<overload>
+    domain, opname_overload = op_name.split("::")
+    op_name, *overload = opname_overload.split(".", 1)
+    overload = overload[0] if overload else None
+    return domain, op_name, overload
